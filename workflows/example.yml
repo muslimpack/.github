@@ -1,0 +1,18 @@
+name: Build and Release HisnElmoslem
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  release:
+    uses: muslimpack/.github/workflows/flutter_release.yaml@main
+    with:
+      app_directory: hisnelmoslem
+      package_name: com.hassaneltantawy.hisnelmoslem
+      java_version: '18'
+    secrets:
+      KEY_PROPERTIES: ${{ secrets.KEY_PROPERTIES }}
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
