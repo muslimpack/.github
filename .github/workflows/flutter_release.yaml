@@ -165,10 +165,56 @@ jobs:
           name: windows-release
           path: ${{ inputs.app_directory }}/${{ env.ZIP_NAME }}
 
+  build_macos:
+    name: Build macOS
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.app_directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Read Flutter version
+        id: flutter-version
+        run: echo "version=$(jq -r .flutter .fvmrc)" >> $GITHUB_OUTPUT
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.flutter-version.outputs.version }}
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: ${{ runner.os }}-pub-${{ hashFiles(format('{0}/pubspec.lock', inputs.app_directory)) }}
+          restore-keys: ${{ runner.os }}-pub-
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Build macOS
+        run: flutter build macos --release
+
+      - name: Package macOS build
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          echo "VERSION_TAG=$version" >> $GITHUB_ENV
+          cd build/macos/Build/Products/Release
+          zip -r "${{ inputs.app_directory }}_${version}_macos.zip" *.app
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: ${{ inputs.app_directory }}/build/macos/Build/Products/Release/${{ inputs.app_directory }}_${{ env.VERSION_TAG }}_macos.zip
+
   create_release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build_android, build_windows]
+    needs: [build_android, build_windows, build_macos]
 
     steps:
       - name: Checkout code
@@ -192,6 +238,12 @@ jobs:
           name: windows-release
           path: .
 
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-release
+          path: .
+
       - name: Extract version tag
         run: echo "VERSION_TAG=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
 
@@ -206,5 +258,6 @@ jobs:
             ${{ inputs.app_directory }}_${{ env.VERSION_TAG }}_android.apk
             ${{ inputs.app_directory }}_${{ env.VERSION_TAG }}_android.aab
             ${{ inputs.app_directory }}_${{ env.VERSION_TAG }}_windows.zip
+            ${{ inputs.app_directory }}_${{ env.VERSION_TAG }}_macos.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
