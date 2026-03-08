@@ -6,16 +6,20 @@ on:
       app_directory:
         required: true
         type: string
-        description: 'Name of the app directory (e.g., hisnelmoslem, alazkar, qadaa)'
+        description: "Name of the app directory (e.g., hisnelmoslem, alazkar, qadaa)"
       package_name:
         required: true
         type: string
-        description: 'Android package name (e.g., com.hassaneltantawy.hisnelmoslem)'
+        description: "Android package name (e.g., com.hassaneltantawy.hisnelmoslem)"
+      app_display_name:
+        required: false
+        type: string
+        description: "Human-readable app name shown in the installer (defaults to app_directory)"
       java_version:
         required: false
         type: string
-        default: '18'
-        description: 'Java version to use'
+        default: "18"
+        description: "Java version to use"
     secrets:
       KEY_PROPERTIES:
         required: true
@@ -43,7 +47,6 @@ jobs:
         run: |
           failed=0
           for f in distribution/whatsnew/*; do
-            # Skip if no files match the glob
             [ -e "$f" ] || { echo "⚠️ No whatsnew files found in distribution/whatsnew/"; break; }
             len=$(wc -m < "$f")
             if [ "$len" -gt 500 ]; then
@@ -74,7 +77,7 @@ jobs:
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: 'zulu'
+          distribution: "zulu"
           java-version: ${{ inputs.java_version }}
 
       - name: Read Flutter version
@@ -140,7 +143,6 @@ jobs:
         run: |
           DIR="build/app/intermediates/merged_native_libs/prodRelease/mergeProdReleaseNativeLibs/out/lib/"
           OUT_ZIP="build/app/debug_symbols.zip"
-
           if [ -d "$DIR" ]; then
             echo "🧩 Found native libs in: $DIR"
             OUT_ZIP_ABS="$(pwd)/$OUT_ZIP"
@@ -166,7 +168,7 @@ jobs:
           whatsNewDirectory: distribution/whatsnew
 
   # ─────────────────────────────────────────────
-  # Job 3: Build Windows
+  # Job 3: Build Windows + Inno Setup Installer
   # ─────────────────────────────────────────────
   build_windows:
     name: Build Windows
@@ -202,24 +204,54 @@ jobs:
         run: flutter pub get
 
       - name: Build Windows
-        run: flutter build windows
+        run: flutter build windows --release
 
-      - name: Package Windows build
+      - name: Resolve app display name
+        id: naming
+        shell: pwsh
+        run: |
+          $displayName = "${{ inputs.app_display_name }}"
+          if ([string]::IsNullOrWhiteSpace($displayName)) {
+            $displayName = "${{ inputs.app_directory }}"
+          }
+          echo "display_name=$displayName" >> $env:GITHUB_OUTPUT
+
+          # Derive exe name: Flutter uses the module name from pubspec.yaml
+          # which matches app_directory but with underscores, lowercased
+          $exeName = "${{ inputs.app_directory }}.exe"
+          echo "exe_name=$exeName" >> $env:GITHUB_OUTPUT
+
+      - name: Copy Inno Setup script
+        shell: pwsh
+        run: |
+          # The .iss file lives at repo root, copy into app directory for Inno
+          Copy-Item -Path "../installer.iss" -Destination "installer.iss"
+
+      - name: Build Inno Setup installer
+        uses: Minionguyjpro/Inno-Setup-Action@v1.2.4
+        with:
+          path: ${{ inputs.app_directory }}/installer.iss
+          options: >-
+            /DAppName="${{ steps.naming.outputs.display_name }}"
+            /DAppVersion="${{ github.ref_name }}"
+            /DAppExeName="${{ steps.naming.outputs.exe_name }}"
+            /DSourceDir="build/windows/x64/runner/Release"
+            /DOutputDir="installer_output"
+
+      - name: Rename installer artifact
+        shell: pwsh
         run: |
           $version = "${{ github.ref_name }}" -replace '^v', ''
-          $zipName = "${{ inputs.app_directory }}_${version}_windows.zip"
+          $installerName = "${{ inputs.app_directory }}_${version}_windows_setup.exe"
+          $srcPath = "installer_output/${{ steps.naming.outputs.display_name }}_${{ github.ref_name }}_windows_setup.exe"
+          Move-Item -Path $srcPath -Destination $installerName
+          echo "INSTALLER_NAME=$installerName" >> $env:GITHUB_ENV
 
-          mkdir ${{ inputs.app_directory }}
-          Copy-Item -Recurse build/windows/x64/runner/Release/* ${{ inputs.app_directory }}/
-          Compress-Archive -Path ${{ inputs.app_directory }} -DestinationPath $zipName
-
-          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
-
-      - name: Upload Windows artifact
+      - name: Upload Windows installer artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-release
-          path: ${{ inputs.app_directory }}/${{ env.ZIP_NAME }}
+          path: ${{ inputs.app_directory }}/${{ env.INSTALLER_NAME }}
 
   # ─────────────────────────────────────────────
   # Job 4: Create GitHub Release
@@ -266,6 +298,6 @@ jobs:
           files: |
             ${{ inputs.app_directory }}_${{ env.VERSION_TAG }}_android.apk
             ${{ inputs.app_directory }}_${{ env.VERSION_TAG }}_android.aab
-            ${{ inputs.app_directory }}_${{ env.VERSION_TAG }}_windows.zip
+            ${{ inputs.app_directory }}_${{ env.VERSION_TAG }}_windows_setup.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
