@@ -15,11 +15,18 @@ on:
         required: false
         type: string
         description: "Human-readable app name shown in the installer (defaults to app_directory)"
+      # Fix 1: flavor is now an input instead of being hardcoded to "prod"
+      flavor:
+        required: false
+        type: string
+        default: "prod"
+        description: "Flutter build flavor (e.g., prod, production, dev)"
+      # Fix 5: changed default from 18 (EOL) to 17 (LTS)
       java_version:
         required: false
         type: string
-        default: "18"
-        description: "Java version to use"
+        default: "17"
+        description: "Java version to use (default: 17 LTS)"
     secrets:
       KEY_PROPERTIES:
         required: true
@@ -108,24 +115,36 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
+      # Fix 3: KEY_PROPERTIES secret now contains the FULL key.properties content.
+      # No longer prepending "storeFile=keystore.jks" — that line must be included
+      # in the secret itself to avoid silently overwriting any extra config.
       - name: Setup Android Signing
         run: |
-          echo "storeFile=keystore.jks" > android/key.properties
-          echo "${{ secrets.KEY_PROPERTIES }}" >> android/key.properties
+          echo "${{ secrets.KEY_PROPERTIES }}" > android/key.properties
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > android/app/keystore.jks
 
+      # Fix 1: --flavor now uses the input variable instead of hardcoded "prod"
       - name: Build APK
-        run: flutter build apk --flavor prod --release
+        run: flutter build apk --flavor ${{ inputs.flavor }} --release
 
       - name: Build App Bundle
-        run: flutter build appbundle --flavor prod --release
+        run: flutter build appbundle --flavor ${{ inputs.flavor }} --release
 
+      # Fix 1: artifact paths now derived from the flavor input
       - name: Rename artifacts
         run: |
           version=${GITHUB_REF_NAME#v}
+          flavor="${{ inputs.flavor }}"
+          # Capitalize first letter for bundle path (e.g. prod -> Prod)
+          flavor_cap="$(echo ${flavor:0:1} | tr '[:lower:]' '[:upper:]')${flavor:1}"
+
           echo "VERSION_TAG=$version" >> $GITHUB_ENV
-          mv build/app/outputs/flutter-apk/app-prod-release.apk ${{ inputs.app_directory }}_${version}_android.apk
-          mv build/app/outputs/bundle/prodRelease/app-prod-release.aab ${{ inputs.app_directory }}_${version}_android.aab
+          echo "FLAVOR_CAP=$flavor_cap" >> $GITHUB_ENV
+
+          mv build/app/outputs/flutter-apk/app-${flavor}-release.apk \
+            ${{ inputs.app_directory }}_${version}_android.apk
+          mv build/app/outputs/bundle/${flavor}Release/app-${flavor}-release.aab \
+            ${{ inputs.app_directory }}_${version}_android.aab
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -139,23 +158,39 @@ jobs:
           name: aab-release
           path: ${{ inputs.app_directory }}/${{ inputs.app_directory }}_${{ env.VERSION_TAG }}_android.aab
 
+      # Fix 2: native lib path now derived from flavor input.
+      # Added find-based fallback to guard against AGP internal path changes.
       - name: Zip debug symbols (if available)
         run: |
-          DIR="build/app/intermediates/merged_native_libs/prodRelease/mergeProdReleaseNativeLibs/out/lib/"
+          flavor="${{ inputs.flavor }}"
+          flavor_cap="${{ env.FLAVOR_CAP }}"
+          DIR="build/app/intermediates/merged_native_libs/${flavor}Release/merge${flavor_cap}ReleaseNativeLibs/out/lib/"
           OUT_ZIP="build/app/debug_symbols.zip"
+
+          # Fallback: search for lib dir if primary path doesn't exist
+          if [ ! -d "$DIR" ]; then
+            echo "⚠️ Primary path not found, searching for native libs..."
+            FOUND=$(find build/app/intermediates/merged_native_libs -type d -name "lib" 2>/dev/null | head -n 1)
+            if [ -n "$FOUND" ]; then
+              DIR="$FOUND"
+              echo "🔍 Found native libs at: $DIR"
+            fi
+          fi
+
           if [ -d "$DIR" ]; then
-            echo "🧩 Found native libs in: $DIR"
+            echo "🧩 Zipping native libs from: $DIR"
             OUT_ZIP_ABS="$(pwd)/$OUT_ZIP"
             cd "$DIR"
             zip -r "$OUT_ZIP_ABS" .
             cd -
-            echo "✅ Debug symbols zipped successfully: $OUT_ZIP_ABS"
+            echo "✅ Debug symbols zipped successfully"
           else
-            echo "⚠️ No native debug symbols directory found at: $DIR"
+            echo "⚠️ No native debug symbols found, uploading empty placeholder"
             mkdir -p "$(dirname $OUT_ZIP)"
             touch "$OUT_ZIP"
           fi
 
+      # Fix 1: mapping path derived from flavor input
       - name: Upload to Google Play
         uses: r0adkll/upload-google-play@v1
         with:
@@ -163,12 +198,14 @@ jobs:
           packageName: ${{ inputs.package_name }}
           releaseFiles: ${{ inputs.app_directory }}/${{ inputs.app_directory }}_${{ env.VERSION_TAG }}_android.aab
           track: production
-          mappingFile: ${{ inputs.app_directory }}/build/app/outputs/mapping/prodRelease/mapping.txt
+          mappingFile: ${{ inputs.app_directory }}/build/app/outputs/mapping/${{ inputs.flavor }}Release/mapping.txt
           debugSymbols: ${{ inputs.app_directory }}/build/app/debug_symbols.zip
           whatsNewDirectory: distribution/whatsnew
 
   # ─────────────────────────────────────────────
-  # Job 3: Build Windows + Inno Setup Installer
+  # Job 3: Build Windows
+  # Produces both a portable .zip and an
+  # Inno Setup installer .exe
   # ─────────────────────────────────────────────
   build_windows:
     name: Build Windows
@@ -206,7 +243,7 @@ jobs:
       - name: Build Windows
         run: flutter build windows --release
 
-      - name: Resolve app display name
+      - name: Resolve app display name and exe name
         id: naming
         shell: pwsh
         run: |
@@ -215,17 +252,32 @@ jobs:
             $displayName = "${{ inputs.app_directory }}"
           }
           echo "display_name=$displayName" >> $env:GITHUB_OUTPUT
+          echo "exe_name=${{ inputs.app_directory }}.exe" >> $env:GITHUB_OUTPUT
 
-          # Derive exe name: Flutter uses the module name from pubspec.yaml
-          # which matches app_directory but with underscores, lowercased
-          $exeName = "${{ inputs.app_directory }}.exe"
-          echo "exe_name=$exeName" >> $env:GITHUB_OUTPUT
-
-      - name: Copy Inno Setup script
+      # ── Portable zip ────────────────────────────
+      - name: Package portable zip
         shell: pwsh
         run: |
-          # The .iss file lives at repo root, copy into app directory for Inno
-          Copy-Item -Path "../installer.iss" -Destination "installer.iss"
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          $zipName = "${{ inputs.app_directory }}_${version}_windows.zip"
+          $buildOutput = "build/windows/x64/runner/Release"
+
+          New-Item -ItemType Directory -Force -Path "portable_staging"
+          Copy-Item -Recurse "$buildOutput\*" "portable_staging/"
+          Compress-Archive -Path "portable_staging" -DestinationPath $zipName
+
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+
+      - name: Upload portable zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: ${{ inputs.app_directory }}/${{ env.ZIP_NAME }}
+
+      # ── Inno Setup installer ─────────────────────
+      - name: Copy Inno Setup script
+        shell: pwsh
+        run: Copy-Item -Path "../installer.iss" -Destination "installer.iss"
 
       - name: Build Inno Setup installer
         uses: Minionguyjpro/Inno-Setup-Action@v1.2.4
@@ -238,7 +290,7 @@ jobs:
             /DSourceDir="build/windows/x64/runner/Release"
             /DOutputDir="installer_output"
 
-      - name: Rename installer artifact
+      - name: Rename installer
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}" -replace '^v', ''
@@ -247,10 +299,10 @@ jobs:
           Move-Item -Path $srcPath -Destination $installerName
           echo "INSTALLER_NAME=$installerName" >> $env:GITHUB_ENV
 
-      - name: Upload Windows installer artifact
+      - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-release
+          name: windows-installer
           path: ${{ inputs.app_directory }}/${{ env.INSTALLER_NAME }}
 
   # ─────────────────────────────────────────────
@@ -279,10 +331,16 @@ jobs:
           name: aab-release
           path: .
 
-      - name: Download Windows artifact
+      - name: Download Windows zip artifact
         uses: actions/download-artifact@v4
         with:
-          name: windows-release
+          name: windows-zip
+          path: .
+
+      - name: Download Windows installer artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
           path: .
 
       - name: Extract version tag
@@ -298,6 +356,7 @@ jobs:
           files: |
             ${{ inputs.app_directory }}_${{ env.VERSION_TAG }}_android.apk
             ${{ inputs.app_directory }}_${{ env.VERSION_TAG }}_android.aab
+            ${{ inputs.app_directory }}_${{ env.VERSION_TAG }}_windows.zip
             ${{ inputs.app_directory }}_${{ env.VERSION_TAG }}_windows_setup.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
