@@ -143,6 +143,13 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
+
+      - name: Clean previous build artifacts
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force windows/flutter/ephemeral -ErrorAction SilentlyContinue
+
       - name: Build Windows
         run: flutter build windows
 
