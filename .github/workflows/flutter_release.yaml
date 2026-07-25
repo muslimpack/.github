@@ -67,22 +67,34 @@ jobs:
           echo "${{ secrets.KEY_PROPERTIES }}" >> android/key.properties
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > android/app/keystore.jks
 
-      - name: Build APK
+      - name: Build universal APK
         run: flutter build apk --flavor prod --release
+
+      - name: Rename universal APK
+        run: mv build/app/outputs/flutter-apk/app-prod-release.apk ${{ inputs.app_directory }}-android.apk
+
+      - name: Build split-per-abi APKs
+        run: flutter build apk --flavor prod --release --split-per-abi
 
       - name: Build App Bundle
         run: flutter build appbundle --flavor prod --release
 
       - name: Rename artifacts
         run: |
-          mv build/app/outputs/flutter-apk/app-prod-release.apk ${{ inputs.app_directory }}-android.apk
+          mv build/app/outputs/flutter-apk/app-prod-armeabi-v7a-release.apk ${{ inputs.app_directory }}-android-armeabi-v7a.apk
+          mv build/app/outputs/flutter-apk/app-prod-arm64-v8a-release.apk ${{ inputs.app_directory }}-android-arm64-v8a.apk
+          mv build/app/outputs/flutter-apk/app-prod-x86_64-release.apk ${{ inputs.app_directory }}-android-x86_64.apk
           mv build/app/outputs/bundle/prodRelease/app-prod-release.aab ${{ inputs.app_directory }}-android.aab
 
-      - name: Upload APK artifact
+      - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
           name: apk-release
-          path: ${{ inputs.app_directory }}/${{ inputs.app_directory }}-android.apk
+          path: |
+            ${{ inputs.app_directory }}/${{ inputs.app_directory }}-android.apk
+            ${{ inputs.app_directory }}/${{ inputs.app_directory }}-android-armeabi-v7a.apk
+            ${{ inputs.app_directory }}/${{ inputs.app_directory }}-android-arm64-v8a.apk
+            ${{ inputs.app_directory }}/${{ inputs.app_directory }}-android-x86_64.apk
 
       - name: Upload AAB artifact
         uses: actions/upload-artifact@v4
@@ -179,7 +191,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download APK artifact
+      - name: Download APK artifacts
         uses: actions/download-artifact@v4
         with:
           name: apk-release
@@ -206,6 +218,9 @@ jobs:
           generate_release_notes: true
           files: |
             ${{ inputs.app_directory }}-android.apk
+            ${{ inputs.app_directory }}-android-armeabi-v7a.apk
+            ${{ inputs.app_directory }}-android-arm64-v8a.apk
+            ${{ inputs.app_directory }}-android-x86_64.apk
             ${{ inputs.app_directory }}-android.aab
             ${{ inputs.app_directory }}-windows.zip
         env:
