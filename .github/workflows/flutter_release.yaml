@@ -209,12 +209,35 @@ jobs:
           name: windows-release
           path: .
 
+      - name: Generate release body
+        run: |
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
+          PLAY_URL="https://play.google.com/store/apps/details?id=${{ inputs.package_name }}"
+
+          cat > release_body.md << EOF
+          ## Downloads
+
+          | Architecture | Windows | Android |
+          |---|---|---|
+          | Universal | — | [APK](${BASE_URL}/${{ inputs.app_directory }}-android.apk) |
+          | x86-64 (64-bit) | [ZIP](${BASE_URL}/${{ inputs.app_directory }}-windows.zip) | [APK](${BASE_URL}/${{ inputs.app_directory }}-android-x86_64.apk) |
+          | AArch64 (ARM64) | — | [APK](${BASE_URL}/${{ inputs.app_directory }}-android-arm64-v8a.apk) |
+          | ARMv7 (32-bit) | — | [APK](${BASE_URL}/${{ inputs.app_directory }}-android-armeabi-v7a.apk) |
+
+          📱 Also available on [Google Play](${PLAY_URL})
+
+          ---
+
+          EOF
+
+          cat CHANGELOG.md >> release_body.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
-          body_path: CHANGELOG.md
+          body_path: release_body.md
           generate_release_notes: true
           files: |
             ${{ inputs.app_directory }}-android.apk
