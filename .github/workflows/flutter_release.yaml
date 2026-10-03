@@ -109,23 +109,14 @@ jobs:
           APP="${{ inputs.app_directory }}"
           found=0
           for abi in armeabi-v7a arm64-v8a x86_64; do
-            src=""
-            if [ -f "build/app/outputs/flutter-apk/app-${abi}-prod-release.apk" ]; then
-              src="build/app/outputs/flutter-apk/app-${abi}-prod-release.apk"
-            elif [ -f "build/app/outputs/flutter-apk/app-prod-${abi}-release.apk" ]; then
-              src="build/app/outputs/flutter-apk/app-prod-${abi}-release.apk"
-            elif [ -f "build/app/outputs/flutter-apk/app-${abi}-release.apk" ]; then
-              src="build/app/outputs/flutter-apk/app-${abi}-release.apk"
-            else
-              src=$(find build/app/outputs/flutter-apk -maxdepth 1 -type f -name "*${abi}*.apk" ! -name "*.sha1" 2>/dev/null | head -n 1)
-            fi
+            src=$(find build/app/outputs/flutter-apk -maxdepth 1 -type f -iname "*${abi}*release.apk" ! -name "*.sha1" 2>/dev/null | head -n 1)
 
             if [ -n "$src" ] && [ -f "$src" ]; then
               mv "$src" "${APP}-android-${abi}.apk"
               echo "✅ Moved $src -> ${APP}-android-${abi}.apk"
               found=$((found + 1))
             else
-              echo "::warning::Split APK for ${abi} was not produced"
+              echo "::warning::Split APK for ${abi} was not produced (searched build/app/outputs/flutter-apk for *${abi}*release.apk)"
             fi
           done
 
