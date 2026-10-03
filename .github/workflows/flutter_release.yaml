@@ -16,6 +16,16 @@ on:
         type: string
         default: "18"
         description: "Java version to use"
+      app_display_name:
+        required: false
+        type: string
+        default: ""
+        description: "Name shown in the Windows installer and Start menu (defaults to app_directory)"
+      app_publisher:
+        required: false
+        type: string
+        default: ""
+        description: "Publisher shown in the Windows installer (defaults to the repository owner)"
     secrets:
       KEY_PROPERTIES:
         required: true
@@ -191,11 +201,171 @@ jobs:
           Copy-Item -Recurse build/windows/x64/runner/Release/* "${{ inputs.app_directory }}/"
           Compress-Archive -Path "${{ inputs.app_directory }}" -DestinationPath $zipName -Force
 
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          function Find-Iscc {
+            $roots = @(${env:ProgramFiles(x86)}, $env:ProgramFiles) | Where-Object { $_ }
+            foreach ($root in $roots) {
+              $found = Get-ChildItem -Path $root -Directory -Filter "Inno Setup*" -ErrorAction SilentlyContinue |
+                ForEach-Object { Join-Path $_.FullName "ISCC.exe" } |
+                Where-Object { Test-Path $_ } |
+                Select-Object -First 1
+              if ($found) { return $found }
+            }
+            return $null
+          }
+
+          $iscc = Find-Iscc
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "Failed to install Inno Setup (exit code $LASTEXITCODE)" }
+            $iscc = Find-Iscc
+          }
+          if (-not $iscc) { throw "ISCC.exe not found after installing Inno Setup" }
+
+          Write-Host "Using $iscc"
+          "ISCC_PATH=$iscc" >> $env:GITHUB_ENV
+
+      - name: Build Windows installer
+        shell: pwsh
+        env:
+          APP_DIR: ${{ inputs.app_directory }}
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          APP_DISPLAY_NAME: ${{ inputs.app_display_name }}
+          APP_PUBLISHER: ${{ inputs.app_publisher }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $displayName = if ($env:APP_DISPLAY_NAME) { $env:APP_DISPLAY_NAME } else { $env:APP_DIR }
+          $publisher = if ($env:APP_PUBLISHER) { $env:APP_PUBLISHER } else { $env:REPO_OWNER }
+
+          # Version: pubspec "version: 1.2.3+4" -> "1.2.3"
+          $pubspec = Get-Content pubspec.yaml -Raw
+          if ($pubspec -notmatch '(?m)^version:\s*(\d+(?:\.\d+)*)') {
+            throw "Could not read version from pubspec.yaml"
+          }
+          $version = $Matches[1]
+
+          # Executable name: BINARY_NAME in windows/CMakeLists.txt (falls back to the app directory name)
+          $appExe = "$($env:APP_DIR).exe"
+          if ((Get-Content windows/CMakeLists.txt -Raw) -match '(?m)^\s*set\(BINARY_NAME\s+"([^"]+)"\)') {
+            $appExe = "$($Matches[1]).exe"
+          }
+
+          $sourceDir = (Resolve-Path build/windows/x64/runner/Release).Path
+          if (-not (Test-Path (Join-Path $sourceDir $appExe))) {
+            throw "Expected executable '$appExe' not found in $sourceDir"
+          }
+
+          # Stable AppId per package so upgrades replace the previous install
+          $md5 = [System.Security.Cryptography.MD5]::Create()
+          $hash = $md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($env:PACKAGE_NAME))
+          $appId = "{{" + ([guid]::new([byte[]]$hash)).ToString().ToUpper() + "}"
+
+          $iconPath = Join-Path (Get-Location).Path "windows/runner/resources/app_icon.ico"
+          $iconLine = if (Test-Path $iconPath) { "SetupIconFile=$iconPath" } else { "" }
+
+          $outputDir = (Get-Location).Path
+          $outputName = "$($env:APP_DIR)-windows-installer"
+
+          $template = @'
+          [Setup]
+          AppId=@@APP_ID@@
+          AppName=@@APP_NAME@@
+          AppVersion=@@APP_VERSION@@
+          AppPublisher=@@APP_PUBLISHER@@
+          DefaultDirName={autopf}\@@APP_NAME@@
+          DisableProgramGroupPage=yes
+          OutputDir=@@OUTPUT_DIR@@
+          OutputBaseFilename=@@OUTPUT_NAME@@
+          Compression=lzma2
+          SolidCompression=yes
+          WizardStyle=modern
+          ArchitecturesAllowed=x64compatible
+          ArchitecturesInstallIn64BitMode=x64compatible
+          PrivilegesRequired=lowest
+          PrivilegesRequiredOverridesAllowed=dialog
+          UninstallDisplayIcon={app}\@@APP_EXE@@
+          @@ICON_LINE@@
+
+          [Tasks]
+          Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+
+          [Files]
+          Source: "@@SOURCE_DIR@@\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{autoprograms}\@@APP_NAME@@"; Filename: "{app}\@@APP_EXE@@"
+          Name: "{autodesktop}\@@APP_NAME@@"; Filename: "{app}\@@APP_EXE@@"; Tasks: desktopicon
+
+          [Run]
+          Filename: "{app}\@@APP_EXE@@"; Description: "{cm:LaunchProgram,@@APP_NAME@@}"; Flags: nowait postinstall skipifsilent
+          '@
+
+          $script = $template
+          $script = $script.Replace("@@APP_ID@@", $appId)
+          $script = $script.Replace("@@APP_NAME@@", $displayName)
+          $script = $script.Replace("@@APP_VERSION@@", $version)
+          $script = $script.Replace("@@APP_PUBLISHER@@", $publisher)
+          $script = $script.Replace("@@OUTPUT_DIR@@", $outputDir)
+          $script = $script.Replace("@@OUTPUT_NAME@@", $outputName)
+          $script = $script.Replace("@@APP_EXE@@", $appExe)
+          $script = $script.Replace("@@SOURCE_DIR@@", $sourceDir)
+          $script = $script.Replace("@@ICON_LINE@@", $iconLine)
+
+          $issPath = Join-Path $env:RUNNER_TEMP "installer.iss"
+          Set-Content -Path $issPath -Value $script -Encoding utf8BOM
+          Write-Host "Generated Inno Setup script:"
+          Get-Content $issPath
+
+          & $env:ISCC_PATH $issPath
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
+          $installer = Join-Path $outputDir "$outputName.exe"
+          if (-not (Test-Path $installer)) { throw "Installer was not created: $installer" }
+
+          "APP_EXE=$appExe" >> $env:GITHUB_ENV
+          "INSTALLER_PATH=$installer" >> $env:GITHUB_ENV
+
+      - name: Test Windows installer (silent install and uninstall)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installDir = Join-Path $env:RUNNER_TEMP "installer-test"
+          $log = Join-Path $env:RUNNER_TEMP "installer-test.log"
+
+          $install = Start-Process -FilePath $env:INSTALLER_PATH -Wait -PassThru -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/CURRENTUSER",
+            "/DIR=`"$installDir`"", "/LOG=`"$log`""
+          )
+          if ($install.ExitCode -ne 0) {
+            if (Test-Path $log) { Get-Content $log }
+            throw "Installer exited with code $($install.ExitCode)"
+          }
+
+          if (-not (Test-Path (Join-Path $installDir $env:APP_EXE))) {
+            if (Test-Path $log) { Get-Content $log }
+            throw "$env:APP_EXE was not installed to $installDir"
+          }
+
+          $uninstaller = Join-Path $installDir "unins000.exe"
+          if (-not (Test-Path $uninstaller)) { throw "Uninstaller not found at $uninstaller" }
+          $uninstall = Start-Process -FilePath $uninstaller -Wait -PassThru -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART")
+          if ($uninstall.ExitCode -ne 0) { throw "Uninstaller exited with code $($uninstall.ExitCode)" }
+
+          Write-Host "Installer smoke test passed"
+
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-release
-          path: ${{ inputs.app_directory }}/${{ inputs.app_directory }}-windows.zip
+          if-no-files-found: error
+          path: |
+            ${{ inputs.app_directory }}/${{ inputs.app_directory }}-windows.zip
+            ${{ inputs.app_directory }}/${{ inputs.app_directory }}-windows-installer.exe
 
   create_release:
     name: Create GitHub Release
@@ -228,18 +398,35 @@ jobs:
 
       - name: Generate release body
         run: |
+          APP="${{ inputs.app_directory }}"
           BASE_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
           PLAY_URL="https://play.google.com/store/apps/details?id=${{ inputs.package_name }}"
+
+          # Only link to artifacts that were actually built
+          link() {
+            if [ -f "$1" ]; then
+              echo "[$2](${BASE_URL}/$1)"
+            else
+              echo "—"
+            fi
+          }
+
+          APK_UNIVERSAL="$(link "${APP}-android.apk" APK)"
+          APK_X86_64="$(link "${APP}-android-x86_64.apk" APK)"
+          APK_ARM64="$(link "${APP}-android-arm64-v8a.apk" APK)"
+          APK_ARMV7="$(link "${APP}-android-armeabi-v7a.apk" APK)"
+          WIN_INSTALLER="$(link "${APP}-windows-installer.exe" Installer)"
+          WIN_ZIP="$(link "${APP}-windows.zip" ZIP)"
 
           cat > release_body.md << EOF
           ## Downloads
 
           | Architecture | Windows | Android |
           |---|---|---|
-          | Universal | — | [APK](${BASE_URL}/${{ inputs.app_directory }}-android.apk) |
-          | x86-64 (64-bit) | [ZIP](${BASE_URL}/${{ inputs.app_directory }}-windows.zip) | [APK](${BASE_URL}/${{ inputs.app_directory }}-android-x86_64.apk) |
-          | AArch64 (ARM64) | — | [APK](${BASE_URL}/${{ inputs.app_directory }}-android-arm64-v8a.apk) |
-          | ARMv7 (32-bit) | — | [APK](${BASE_URL}/${{ inputs.app_directory }}-android-armeabi-v7a.apk) |
+          | Universal | — | ${APK_UNIVERSAL} |
+          | x86-64 (64-bit) | ${WIN_INSTALLER} · ${WIN_ZIP} | ${APK_X86_64} |
+          | AArch64 (ARM64) | — | ${APK_ARM64} |
+          | ARMv7 (32-bit) | — | ${APK_ARMV7} |
 
           📱 Also available on [Google Play](${PLAY_URL})
 
@@ -247,7 +434,11 @@ jobs:
 
           EOF
 
-          cat CHANGELOG.md >> release_body.md
+          if [ -f CHANGELOG.md ]; then
+            cat CHANGELOG.md >> release_body.md
+          else
+            echo "::warning::CHANGELOG.md not found, release body will not include a changelog"
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -263,5 +454,6 @@ jobs:
             ${{ inputs.app_directory }}-android-x86_64.apk
             ${{ inputs.app_directory }}-android.aab
             ${{ inputs.app_directory }}-windows.zip
+            ${{ inputs.app_directory }}-windows-installer.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

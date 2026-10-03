@@ -18,7 +18,7 @@ This guide explains how to set up and use the reusable Flutter release workflow 
 This workflow automates the build and release process for Flutter applications:
 
 - ✅ Builds Android APK and AAB (App Bundle)
-- ✅ Builds Windows executable
+- ✅ Builds Windows executable (ZIP + Inno Setup installer)
 - ✅ Uploads to Google Play Store (production track)
 - ✅ Creates GitHub Release with all artifacts
 - ✅ Handles debug symbols and ProGuard mapping files
@@ -157,6 +157,8 @@ Update these values:
 - `app_directory`: Name of your Flutter app directory (e.g., `hisnelmoslem`, `alazkar`, `qadaa`)
 - `package_name`: Your Android package name (e.g., `com.hassaneltantawy.hisnelmoslem`)
 - `java_version`: Java version to use (default: `'18'`)
+- `app_display_name` *(optional)*: Name shown in the Windows installer and Start menu (default: `app_directory`)
+- `app_publisher` *(optional)*: Publisher shown in the Windows installer (default: repository owner)
 
 ### Step 3: Configure Android Flavor
 
@@ -239,7 +241,8 @@ The workflow produces the following artifacts:
 ### GitHub Release Files:
 - `yourapp_3.0.0_android.apk` - Direct download APK
 - `yourapp_3.0.0_android.aab` - App Bundle
-- `yourapp_3.0.0_windows.zip` - Windows executable
+- `yourapp_3.0.0_windows.zip` - Windows executable (portable)
+- `yourapp-windows-installer.exe` - Windows installer (Inno Setup, per-user by default)
 
 ### Google Play:
 - App Bundle uploaded to Production track
