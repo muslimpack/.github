@@ -47,7 +47,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: "zulu"
           java-version: ${{ inputs.java_version }}
@@ -81,7 +81,19 @@ jobs:
         run: flutter build apk --flavor prod --release
 
       - name: Rename universal APK
-        run: mv build/app/outputs/flutter-apk/app-prod-release.apk ${{ inputs.app_directory }}-android.apk
+        run: |
+          APP="${{ inputs.app_directory }}"
+          src="build/app/outputs/flutter-apk/app-prod-release.apk"
+          if [ ! -f "$src" ]; then
+            src=$(find build/app/outputs/flutter-apk -maxdepth 1 -type f -name "*.apk" ! -name "*arm*" ! -name "*x86*" ! -name "*.sha1" 2>/dev/null | head -n 1)
+          fi
+          if [ -n "$src" ] && [ -f "$src" ]; then
+            mv "$src" "${APP}-android.apk"
+            echo "✅ Moved $src -> ${APP}-android.apk"
+          else
+            echo "::error::Universal APK was not found"
+            exit 1
+          fi
 
       - name: Build split-per-abi APKs
         run: flutter build apk --flavor prod --release --split-per-abi
@@ -97,12 +109,23 @@ jobs:
           APP="${{ inputs.app_directory }}"
           found=0
           for abi in armeabi-v7a arm64-v8a x86_64; do
-            src="build/app/outputs/flutter-apk/app-prod-${abi}-release.apk"
-            if [ -f "$src" ]; then
+            src=""
+            if [ -f "build/app/outputs/flutter-apk/app-${abi}-prod-release.apk" ]; then
+              src="build/app/outputs/flutter-apk/app-${abi}-prod-release.apk"
+            elif [ -f "build/app/outputs/flutter-apk/app-prod-${abi}-release.apk" ]; then
+              src="build/app/outputs/flutter-apk/app-prod-${abi}-release.apk"
+            elif [ -f "build/app/outputs/flutter-apk/app-${abi}-release.apk" ]; then
+              src="build/app/outputs/flutter-apk/app-${abi}-release.apk"
+            else
+              src=$(find build/app/outputs/flutter-apk -maxdepth 1 -type f -name "*${abi}*.apk" ! -name "*.sha1" 2>/dev/null | head -n 1)
+            fi
+
+            if [ -n "$src" ] && [ -f "$src" ]; then
               mv "$src" "${APP}-android-${abi}.apk"
+              echo "✅ Moved $src -> ${APP}-android-${abi}.apk"
               found=$((found + 1))
             else
-              echo "::warning::Split APK for ${abi} was not produced: $src"
+              echo "::warning::Split APK for ${abi} was not produced"
             fi
           done
 
@@ -111,7 +134,17 @@ jobs:
             exit 1
           fi
 
-          mv build/app/outputs/bundle/prodRelease/app-prod-release.aab "${APP}-android.aab"
+          aab_src="build/app/outputs/bundle/prodRelease/app-prod-release.aab"
+          if [ ! -f "$aab_src" ]; then
+            aab_src=$(find build/app/outputs/bundle -type f -name "*.aab" 2>/dev/null | head -n 1)
+          fi
+          if [ -n "$aab_src" ] && [ -f "$aab_src" ]; then
+            mv "$aab_src" "${APP}-android.aab"
+            echo "✅ Moved $aab_src -> ${APP}-android.aab"
+          else
+            echo "::error::App bundle (.aab) was not found"
+            exit 1
+          fi
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
