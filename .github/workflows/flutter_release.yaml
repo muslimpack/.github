@@ -81,10 +81,27 @@ jobs:
 
       - name: Rename artifacts
         run: |
-          mv build/app/outputs/flutter-apk/app-prod-armeabi-v7a-release.apk ${{ inputs.app_directory }}-android-armeabi-v7a.apk
-          mv build/app/outputs/flutter-apk/app-prod-arm64-v8a-release.apk ${{ inputs.app_directory }}-android-arm64-v8a.apk
-          mv build/app/outputs/flutter-apk/app-prod-x86_64-release.apk ${{ inputs.app_directory }}-android-x86_64.apk
-          mv build/app/outputs/bundle/prodRelease/app-prod-release.aab ${{ inputs.app_directory }}-android.aab
+          echo "📂 Build outputs:"
+          ls -la build/app/outputs/flutter-apk/ build/app/outputs/bundle/prodRelease/
+
+          APP="${{ inputs.app_directory }}"
+          found=0
+          for abi in armeabi-v7a arm64-v8a x86_64; do
+            src="build/app/outputs/flutter-apk/app-prod-${abi}-release.apk"
+            if [ -f "$src" ]; then
+              mv "$src" "${APP}-android-${abi}.apk"
+              found=$((found + 1))
+            else
+              echo "::warning::Split APK for ${abi} was not produced: $src"
+            fi
+          done
+
+          if [ "$found" -eq 0 ]; then
+            echo "::error::No split-per-abi APKs were produced"
+            exit 1
+          fi
+
+          mv build/app/outputs/bundle/prodRelease/app-prod-release.aab "${APP}-android.aab"
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
