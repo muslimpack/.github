@@ -190,7 +190,7 @@ When `-Platform All` is run, the output directory will contain:
 | `<app>-android-arm64-v8a.apk` | ARM64 Split APK | Modern phones and tablets |
 | `<app>-android-armeabi-v7a.apk` | ARMv7 Split APK | Legacy 32-bit Android devices |
 | `<app>-android-x86_64.apk` | x86-64 Split APK | Android emulators & Chromebooks |
-| `<app>-android.aab` | Android App Bundle | Google Play Store console upload |
+| `<app>-android.aab` | Android App Bundle | Google Play Store console upload (omitted from public GitHub Releases) |
 | `<app>-windows.zip` | Standalone ZIP | Portable Windows version without install |
 | `<app>-windows-installer.exe` | Inno Setup Setup EXE | Clean Windows installer with desktop & start menu shortcuts |
 | `debug_symbols.zip` | Native Debug Symbols | Crash symbolication on Google Play / Bugsnag |

@@ -408,12 +408,6 @@ jobs:
           name: apk-release
           path: .
 
-      - name: Download AAB artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: aab-release
-          path: .
-
       - name: Download Windows artifact
         uses: actions/download-artifact@v4
         with:
@@ -476,7 +470,6 @@ jobs:
             ${{ inputs.app_directory }}-android-armeabi-v7a.apk
             ${{ inputs.app_directory }}-android-arm64-v8a.apk
             ${{ inputs.app_directory }}-android-x86_64.apk
-            ${{ inputs.app_directory }}-android.aab
             ${{ inputs.app_directory }}-windows.zip
             ${{ inputs.app_directory }}-windows-installer.exe
         env:
