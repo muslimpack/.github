@@ -1,5 +1,17 @@
 name: Flutter Release Workflow
 
+# Shared build + release pipeline for all muslimpack Flutter apps (v2).
+#
+# Callers should pin a version tag:
+#   uses: muslimpack/.github/.github/workflows/flutter_release.yaml@v2
+#
+# Stages:  prepare -> build_<platform> (parallel) -> publish_* (only after every selected build passed)
+#
+# "auto" behaviour (used when the caller does not say otherwise):
+#   tag vX.Y.Z        -> GitHub release      + Google Play production
+#   tag vX.Y.Z-rc.1   -> GitHub pre-release  + Google Play internal track
+#   manual run        -> build only (artifacts stay on the workflow run)
+
 on:
   workflow_call:
     inputs:
@@ -14,8 +26,38 @@ on:
       java_version:
         required: false
         type: string
-        default: "18"
+        default: "17"
         description: "Java version to use"
+      flavor:
+        required: false
+        type: string
+        default: "prod"
+        description: "Android product flavor. Use an empty string for apps without flavors"
+      platforms:
+        required: false
+        type: string
+        default: "android,windows"
+        description: "Comma separated list of platforms to build: android, windows, ios"
+      github_release:
+        required: false
+        type: string
+        default: "auto"
+        description: "auto | none | draft | prerelease | release"
+      play_track:
+        required: false
+        type: string
+        default: "auto"
+        description: "auto | none | internal | alpha | beta | production"
+      play_rollout:
+        required: false
+        type: string
+        default: "100"
+        description: "'draft' (upload only, you publish from Play Console) or a rollout percentage 1-100"
+      testflight:
+        required: false
+        type: boolean
+        default: true
+        description: "Upload the iOS build to TestFlight (only when ios is in platforms)"
       app_display_name:
         required: false
         type: string
@@ -27,20 +69,152 @@ on:
         default: ""
         description: "Publisher shown in the Windows installer (defaults to the repository owner)"
     secrets:
+      # Android (needed when android is in platforms)
       KEY_PROPERTIES:
-        required: true
+        required: false
       KEYSTORE_BASE64:
-        required: true
+        required: false
+      # Google Play (needed when play_track is not none)
       SERVICE_ACCOUNT_JSON:
-        required: true
+        required: false
+      # iOS (needed when ios is in platforms)
+      APPLE_TEAM_ID:
+        required: false
+      APPSTORE_KEY_ID:
+        required: false
+      APPSTORE_ISSUER_ID:
+        required: false
+      APPSTORE_PRIVATE_KEY:
+        required: false
 
 jobs:
+  prepare:
+    name: Resolve release plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      android: ${{ steps.plan.outputs.android }}
+      windows: ${{ steps.plan.outputs.windows }}
+      ios: ${{ steps.plan.outputs.ios }}
+      github_release: ${{ steps.plan.outputs.github_release }}
+      play_track: ${{ steps.plan.outputs.play_track }}
+      play_status: ${{ steps.plan.outputs.play_status }}
+      play_fraction: ${{ steps.plan.outputs.play_fraction }}
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      flutter: ${{ steps.plan.outputs.flutter }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve plan
+        id: plan
+        working-directory: ${{ inputs.app_directory }}
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+          GITHUB_RELEASE: ${{ inputs.github_release }}
+          PLAY_TRACK: ${{ inputs.play_track }}
+          PLAY_ROLLOUT: ${{ inputs.play_rollout }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+
+          # --- versions -----------------------------------------------------
+          [ -f .fvmrc ] || fail ".fvmrc not found in $(pwd); it is used to pick the Flutter version"
+          flutter=$(jq -r .flutter .fvmrc)
+          full_version=$(grep -m1 -E '^version:' pubspec.yaml | sed -E 's/^version:[[:space:]]*//; s/[[:space:]]+$//')
+          version="${full_version%%+*}"
+          [ -n "$version" ] || fail "Could not read version from pubspec.yaml"
+
+          # --- platforms ----------------------------------------------------
+          android=false; windows=false; ios=false
+          for p in $(echo "$PLATFORMS" | tr 'A-Z' 'a-z' | tr ',' ' '); do
+            case "$p" in
+              android) android=true ;;
+              windows) windows=true ;;
+              ios) ios=true ;;
+              all) android=true; windows=true; ios=true ;;
+              *) fail "Unknown platform '$p' (allowed: android, windows, ios)" ;;
+            esac
+          done
+          if [ "$android$windows$ios" = "falsefalsefalse" ]; then fail "No platform selected"; fi
+
+          # --- tag ----------------------------------------------------------
+          is_tag=false; pre=false
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            is_tag=true
+            tag="$GITHUB_REF_NAME"
+            case "$tag" in *-*) pre=true ;; esac
+            base="${tag#v}"; base="${base%%-*}"
+            if [ "$base" != "$version" ]; then
+              fail "Tag $tag does not match pubspec.yaml version $version. Bump pubspec.yaml or fix the tag."
+            fi
+          else
+            tag="v$version"
+          fi
+
+          # --- GitHub release -----------------------------------------------
+          gh="$GITHUB_RELEASE"
+          if [ "$gh" = "auto" ]; then
+            if [ "$is_tag" = false ]; then gh=none
+            elif [ "$pre" = true ]; then gh=prerelease
+            else gh=release; fi
+          fi
+          case "$gh" in none|draft|prerelease|release) ;; *) fail "Invalid github_release '$gh'" ;; esac
+
+          # --- Google Play --------------------------------------------------
+          track="$PLAY_TRACK"
+          if [ "$track" = "auto" ]; then
+            if [ "$is_tag" = false ]; then track=none
+            elif [ "$pre" = true ]; then track=internal
+            else track=production; fi
+          fi
+          case "$track" in none|internal|alpha|beta|production) ;; *) fail "Invalid play_track '$track'" ;; esac
+          if [ "$android" = false ]; then track=none; fi
+
+          status=completed; fraction=""
+          case "$PLAY_ROLLOUT" in
+            draft) status=draft ;;
+            ""|100) ;;
+            *)
+              echo "$PLAY_ROLLOUT" | grep -Eq '^[0-9]{1,2}$' || fail "Invalid play_rollout '$PLAY_ROLLOUT' (use draft or 1-100)"
+              [ "$PLAY_ROLLOUT" -ge 1 ] || fail "play_rollout must be between 1 and 100"
+              status=inProgress
+              fraction=$(awk "BEGIN { printf \"%.2f\", $PLAY_ROLLOUT / 100 }")
+              ;;
+          esac
+
+          {
+            echo "android=$android"; echo "windows=$windows"; echo "ios=$ios"
+            echo "github_release=$gh"; echo "play_track=$track"
+            echo "play_status=$status"; echo "play_fraction=$fraction"
+            echo "tag=$tag"; echo "version=$version"; echo "flutter=$flutter"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Release plan"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`$full_version\` (tag \`$tag\`) |"
+            echo "| Flutter | \`$flutter\` |"
+            echo "| Platforms | android=$android · windows=$windows · ios=$ios |"
+            echo "| GitHub release | $gh |"
+            echo "| Google Play | $track ($status${fraction:+ $fraction}) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   build_android:
     name: Build Android
+    needs: prepare
+    if: needs.prepare.outputs.android == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: ${{ inputs.app_directory }}
+    env:
+      APP: ${{ inputs.app_directory }}
+      FLAVOR: ${{ inputs.flavor }}
 
     steps:
       - name: Checkout code
@@ -52,139 +226,113 @@ jobs:
           distribution: "zulu"
           java-version: ${{ inputs.java_version }}
 
-      - name: Read Flutter version
-        id: flutter-version
-        run: echo "version=$(jq -r .flutter .fvmrc)" >> $GITHUB_OUTPUT
-
       - name: Setup Flutter
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
-          flutter-version: ${{ steps.flutter-version.outputs.version }}
+          flutter-version: ${{ needs.prepare.outputs.flutter }}
+          cache: true
 
-      - name: Cache Flutter dependencies
+      - name: Cache pub and Gradle
         uses: actions/cache@v4
         with:
-          path: ~/.pub-cache
-          key: ${{ runner.os }}-pub-${{ hashFiles(format('{0}/pubspec.lock', inputs.app_directory)) }}
-          restore-keys: ${{ runner.os }}-pub-
+          path: |
+            ~/.pub-cache
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-android-${{ hashFiles(format('{0}/pubspec.lock', inputs.app_directory), format('{0}/android/**/*.gradle*', inputs.app_directory), format('{0}/android/gradle/wrapper/gradle-wrapper.properties', inputs.app_directory)) }}
+          restore-keys: ${{ runner.os }}-android-
 
       - name: Get dependencies
-        run: flutter pub get
+        run: flutter pub get --enforce-lockfile
 
       - name: Setup Android Signing
+        env:
+          KEY_PROPERTIES: ${{ secrets.KEY_PROPERTIES }}
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
+          if [ -z "$KEY_PROPERTIES" ] || [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::KEY_PROPERTIES and KEYSTORE_BASE64 secrets are required to build Android"
+            exit 1
+          fi
           echo "storeFile=keystore.jks" > android/key.properties
-          echo "${{ secrets.KEY_PROPERTIES }}" >> android/key.properties
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > android/app/keystore.jks
+          printf '%s\n' "$KEY_PROPERTIES" >> android/key.properties
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > android/app/keystore.jks
 
       - name: Build universal APK
-        run: flutter build apk --flavor prod --release
-
-      - name: Rename universal APK
         run: |
-          APP="${{ inputs.app_directory }}"
-          src="build/app/outputs/flutter-apk/app-prod-release.apk"
-          if [ ! -f "$src" ]; then
-            src=$(find build/app/outputs/flutter-apk -maxdepth 1 -type f -name "*.apk" ! -name "*arm*" ! -name "*x86*" ! -name "*.sha1" 2>/dev/null | head -n 1)
-          fi
-          if [ -n "$src" ] && [ -f "$src" ]; then
-            mv "$src" "${APP}-android.apk"
-            echo "✅ Moved $src -> ${APP}-android.apk"
-          else
+          flutter build apk --release ${FLAVOR:+--flavor "$FLAVOR"}
+          src=$(find build/app/outputs/flutter-apk -maxdepth 1 -type f -name "*release.apk" ! -name "*arm*" ! -name "*x86*" | head -n 1)
+          if [ -z "$src" ]; then
             echo "::error::Universal APK was not found"
             exit 1
           fi
+          mkdir -p dist
+          mv "$src" "dist/${APP}-android.apk"
 
       - name: Build split-per-abi APKs
-        run: flutter build apk --flavor prod --release --split-per-abi
-
-      - name: Build App Bundle
-        run: flutter build appbundle --flavor prod --release
-
-      - name: Rename artifacts
         run: |
-          echo "📂 Build outputs:"
-          ls -la build/app/outputs/flutter-apk/ build/app/outputs/bundle/prodRelease/
-
-          APP="${{ inputs.app_directory }}"
+          flutter build apk --release --split-per-abi ${FLAVOR:+--flavor "$FLAVOR"}
           found=0
           for abi in armeabi-v7a arm64-v8a x86_64; do
-            src=$(find build/app/outputs/flutter-apk -maxdepth 1 -type f -iname "*${abi}*release.apk" ! -name "*.sha1" 2>/dev/null | head -n 1)
-
-            if [ -n "$src" ] && [ -f "$src" ]; then
-              mv "$src" "${APP}-android-${abi}.apk"
-              echo "✅ Moved $src -> ${APP}-android-${abi}.apk"
+            src=$(find build/app/outputs/flutter-apk -maxdepth 1 -type f -iname "*${abi}*release.apk" | head -n 1)
+            if [ -n "$src" ]; then
+              mv "$src" "dist/${APP}-android-${abi}.apk"
               found=$((found + 1))
             else
-              echo "::warning::Split APK for ${abi} was not produced (searched build/app/outputs/flutter-apk for *${abi}*release.apk)"
+              echo "::warning::Split APK for ${abi} was not produced"
             fi
           done
-
           if [ "$found" -eq 0 ]; then
             echo "::error::No split-per-abi APKs were produced"
-            exit 1
-          fi
-
-          aab_src="build/app/outputs/bundle/prodRelease/app-prod-release.aab"
-          if [ ! -f "$aab_src" ]; then
-            aab_src=$(find build/app/outputs/bundle -type f -name "*.aab" 2>/dev/null | head -n 1)
-          fi
-          if [ -n "$aab_src" ] && [ -f "$aab_src" ]; then
-            mv "$aab_src" "${APP}-android.aab"
-            echo "✅ Moved $aab_src -> ${APP}-android.aab"
-          else
-            echo "::error::App bundle (.aab) was not found"
             exit 1
           fi
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: apk-release
-          path: |
-            ${{ inputs.app_directory }}/${{ inputs.app_directory }}-android.apk
-            ${{ inputs.app_directory }}/${{ inputs.app_directory }}-android-armeabi-v7a.apk
-            ${{ inputs.app_directory }}/${{ inputs.app_directory }}-android-arm64-v8a.apk
-            ${{ inputs.app_directory }}/${{ inputs.app_directory }}-android-x86_64.apk
+          name: release-android
+          if-no-files-found: error
+          path: ${{ inputs.app_directory }}/dist/*.apk
 
-      - name: Upload AAB artifact
+      # Everything below is only needed for Google Play
+      - name: Build App Bundle
+        if: needs.prepare.outputs.play_track != 'none'
+        run: |
+          flutter build appbundle --release ${FLAVOR:+--flavor "$FLAVOR"}
+          mkdir -p play
+          aab=$(find build/app/outputs/bundle -type f -name "*.aab" | head -n 1)
+          if [ -z "$aab" ]; then
+            echo "::error::App bundle (.aab) was not found"
+            exit 1
+          fi
+          mv "$aab" "play/${APP}-android.aab"
+
+          mapping=$(find build/app/outputs/mapping -type f -name mapping.txt 2>/dev/null | head -n 1 || true)
+          if [ -n "$mapping" ]; then cp "$mapping" play/mapping.txt; fi
+
+          libs=$(find build/app/intermediates/merged_native_libs -type d -path "*Release*/out/lib" 2>/dev/null | head -n 1 || true)
+          if [ -n "$libs" ]; then
+            out="$(pwd)/play/debug_symbols.zip"
+            (cd "$libs" && zip -qr "$out" .)
+          else
+            echo "::warning::No native debug symbols found; uploading without them"
+          fi
+          ls -la play
+
+      - name: Upload Play bundle artifact
+        if: needs.prepare.outputs.play_track != 'none'
         uses: actions/upload-artifact@v4
         with:
-          name: aab-release
-          path: ${{ inputs.app_directory }}/${{ inputs.app_directory }}-android.aab
-
-      - name: Zip debug symbols (if available)
-        run: |
-          DIR="build/app/intermediates/merged_native_libs/prodRelease/mergeProdReleaseNativeLibs/out/lib/"
-          OUT_ZIP="build/app/debug_symbols.zip"
-
-          if [ -d "$DIR" ]; then
-            echo "🧩 Found native libs in: $DIR"
-            OUT_ZIP_ABS="$(pwd)/$OUT_ZIP"
-            cd "$DIR"
-            zip -r "$OUT_ZIP_ABS" .
-            cd -
-            echo "✅ Debug symbols zipped successfully: $OUT_ZIP_ABS"
-          else
-            echo "⚠️ No native debug symbols directory found at: $DIR"
-            mkdir -p "$(dirname $OUT_ZIP)"
-            touch "$OUT_ZIP"
-          fi
-
-      - name: Upload to Google Play
-        uses: r0adkll/upload-google-play@v1
-        with:
-          serviceAccountJsonPlainText: ${{ secrets.SERVICE_ACCOUNT_JSON }}
-          packageName: ${{ inputs.package_name }}
-          releaseFiles: ${{ inputs.app_directory }}/${{ inputs.app_directory }}-android.aab
-          track: production
-          mappingFile: ${{ inputs.app_directory }}/build/app/outputs/mapping/prodRelease/mapping.txt
-          debugSymbols: ${{ inputs.app_directory }}/build/app/debug_symbols.zip
-          whatsNewDirectory: distribution/whatsnew
+          name: play-bundle
+          if-no-files-found: error
+          path: ${{ inputs.app_directory }}/play/*
 
   build_windows:
     name: Build Windows
+    needs: prepare
+    if: needs.prepare.outputs.windows == 'true'
     runs-on: windows-latest
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: ${{ inputs.app_directory }}
@@ -193,19 +341,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Read Flutter version
-        id: flutter-version
-        shell: pwsh
-        run: echo "version=$(Get-Content -Path .fvmrc | ConvertFrom-Json | Select-Object -ExpandProperty flutter)" >> $env:GITHUB_OUTPUT
-
       - name: Setup Flutter
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
-          flutter-version: ${{ steps.flutter-version.outputs.version }}
+          flutter-version: ${{ needs.prepare.outputs.flutter }}
+          cache: true
 
       - name: Get dependencies
-        run: flutter pub get
-
+        run: flutter pub get --enforce-lockfile
 
       - name: Clean previous build artifacts
         shell: pwsh
@@ -385,72 +528,166 @@ jobs:
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-release
+          name: release-windows
           if-no-files-found: error
           path: |
             ${{ inputs.app_directory }}/${{ inputs.app_directory }}-windows.zip
             ${{ inputs.app_directory }}/${{ inputs.app_directory }}-windows-installer.exe
 
-  create_release:
-    name: Create GitHub Release
-    runs-on: ubuntu-latest
-    needs:
-      - build_android
-      - build_windows
+  build_ios:
+    name: Build iOS
+    needs: prepare
+    if: needs.prepare.outputs.ios == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: ${{ inputs.app_directory }}
+    env:
+      APP: ${{ inputs.app_directory }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPSTORE_KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+      APPSTORE_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download APK artifacts
-        uses: actions/download-artifact@v4
+      - name: Setup Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
-          name: apk-release
-          path: .
+          flutter-version: ${{ needs.prepare.outputs.flutter }}
+          cache: true
 
-      - name: Download Windows artifact
+      - name: Get dependencies
+        run: flutter pub get --enforce-lockfile
+
+      - name: Install App Store Connect API key
+        env:
+          APPSTORE_PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
+        run: |
+          if [ -z "$APPLE_TEAM_ID" ] || [ -z "$APPSTORE_KEY_ID" ] || [ -z "$APPSTORE_ISSUER_ID" ] || [ -z "$APPSTORE_PRIVATE_KEY" ]; then
+            echo "::error::APPLE_TEAM_ID, APPSTORE_KEY_ID, APPSTORE_ISSUER_ID and APPSTORE_PRIVATE_KEY secrets are required to build iOS"
+            exit 1
+          fi
+          mkdir -p "$HOME/.private_keys"
+          printf '%s\n' "$APPSTORE_PRIVATE_KEY" > "$HOME/.private_keys/AuthKey_${APPSTORE_KEY_ID}.p8"
+
+      # Build the archive unsigned, then let Xcode sign it during export using
+      # cloud-managed certificates fetched with the App Store Connect API key.
+      - name: Build archive
+        run: flutter build ipa --release --no-codesign
+
+      - name: Sign and export IPA
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>destination</key>
+            <string>export</string>
+            <key>teamID</key>
+            <string>${APPLE_TEAM_ID}</string>
+            <key>signingStyle</key>
+            <string>automatic</string>
+            <key>uploadSymbols</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          xcodebuild -exportArchive \
+            -archivePath build/ios/archive/Runner.xcarchive \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath build/ios/ipa \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$HOME/.private_keys/AuthKey_${APPSTORE_KEY_ID}.p8" \
+            -authenticationKeyID "$APPSTORE_KEY_ID" \
+            -authenticationKeyIssuerID "$APPSTORE_ISSUER_ID"
+
+          ipa=$(find build/ios/ipa -maxdepth 1 -name "*.ipa" | head -n 1)
+          if [ -z "$ipa" ]; then
+            echo "::error::IPA was not produced"
+            exit 1
+          fi
+          mkdir -p dist
+          mv "$ipa" "dist/${APP}-ios.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          if-no-files-found: error
+          path: ${{ inputs.app_directory }}/dist/*.ipa
+
+  # ---------------------------------------------------------------------------
+  # Publishing. Nothing below runs unless every selected build succeeded.
+  # ---------------------------------------------------------------------------
+
+  publish_github:
+    name: Publish GitHub release
+    needs: [prepare, build_android, build_windows, build_ios]
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled') &&
+      needs.prepare.outputs.github_release != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
-          name: windows-release
-          path: .
+          pattern: release-*
+          merge-multiple: true
+          path: dist
 
       - name: Generate release body
+        env:
+          APP: ${{ inputs.app_directory }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          PLAY_TRACK: ${{ needs.prepare.outputs.play_track }}
         run: |
-          APP="${{ inputs.app_directory }}"
-          BASE_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
-          PLAY_URL="https://play.google.com/store/apps/details?id=${{ inputs.package_name }}"
+          ls -la dist
+          BASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
 
           # Only link to artifacts that were actually built
           link() {
-            if [ -f "$1" ]; then
+            if [ -f "dist/$1" ]; then
               echo "[$2](${BASE_URL}/$1)"
             else
               echo "—"
             fi
           }
 
-          APK_UNIVERSAL="$(link "${APP}-android.apk" APK)"
-          APK_X86_64="$(link "${APP}-android-x86_64.apk" APK)"
-          APK_ARM64="$(link "${APP}-android-arm64-v8a.apk" APK)"
-          APK_ARMV7="$(link "${APP}-android-armeabi-v7a.apk" APK)"
-          WIN_INSTALLER="$(link "${APP}-windows-installer.exe" Installer)"
-          WIN_ZIP="$(link "${APP}-windows.zip" ZIP)"
-
-          cat > release_body.md << EOF
-          ## Downloads
-
-          | Architecture | Windows | Android |
-          |---|---|---|
-          | Universal | — | ${APK_UNIVERSAL} |
-          | x86-64 (64-bit) | ${WIN_INSTALLER} · ${WIN_ZIP} | ${APK_X86_64} |
-          | AArch64 (ARM64) | — | ${APK_ARM64} |
-          | ARMv7 (32-bit) | — | ${APK_ARMV7} |
-
-          📱 Also available on [Google Play](${PLAY_URL})
-
-          ---
-
-          EOF
+          {
+            echo "## Downloads"
+            echo
+            echo "| Architecture | Windows | Android |"
+            echo "|---|---|---|"
+            echo "| Universal | — | $(link "${APP}-android.apk" APK) |"
+            echo "| x86-64 (64-bit) | $(link "${APP}-windows-installer.exe" Installer) · $(link "${APP}-windows.zip" ZIP) | $(link "${APP}-android-x86_64.apk" APK) |"
+            echo "| AArch64 (ARM64) | — | $(link "${APP}-android-arm64-v8a.apk" APK) |"
+            echo "| ARMv7 (32-bit) | — | $(link "${APP}-android-armeabi-v7a.apk" APK) |"
+            echo
+            if [ "$PLAY_TRACK" = "production" ]; then
+              echo "📱 Also available on [Google Play](https://play.google.com/store/apps/details?id=${PACKAGE_NAME})"
+              echo
+            fi
+            echo "---"
+            echo
+          } > release_body.md
 
           if [ -f CHANGELOG.md ]; then
             cat CHANGELOG.md >> release_body.md
@@ -459,18 +696,109 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.prepare.outputs.tag }}
           body_path: release_body.md
           generate_release_notes: true
-          files: |
-            ${{ inputs.app_directory }}-android.apk
-            ${{ inputs.app_directory }}-android-armeabi-v7a.apk
-            ${{ inputs.app_directory }}-android-arm64-v8a.apk
-            ${{ inputs.app_directory }}-android-x86_64.apk
-            ${{ inputs.app_directory }}-windows.zip
-            ${{ inputs.app_directory }}-windows-installer.exe
+          draft: ${{ needs.prepare.outputs.github_release == 'draft' }}
+          prerelease: ${{ needs.prepare.outputs.github_release == 'prerelease' }}
+          fail_on_unmatched_files: true
+          files: dist/*
+
+  publish_play:
+    name: Publish to Google Play (${{ needs.prepare.outputs.play_track }})
+    needs: [prepare, build_android, build_windows, build_ios]
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled') &&
+      needs.prepare.outputs.play_track != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Add required reviewers to the "play-production" environment in the app
+    # repo (Settings > Environments) to get an approval button before go-live.
+    environment: play-${{ needs.prepare.outputs.play_track }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Play bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: play-bundle
+          path: play
+
+      - name: Locate optional files
+        id: files
+        run: |
+          if [ -f play/mapping.txt ]; then echo "mapping=play/mapping.txt" >> "$GITHUB_OUTPUT"; fi
+          if [ -f play/debug_symbols.zip ]; then echo "symbols=play/debug_symbols.zip" >> "$GITHUB_OUTPUT"; fi
+          if [ -d distribution/whatsnew ]; then echo "whatsnew=distribution/whatsnew" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Upload to Google Play
+        if: needs.prepare.outputs.play_status != 'inProgress'
+        uses: r0adkll/upload-google-play@e738b9dd8f2476ea806d921b64aacd24f34515a5 # v1.1.5
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+          packageName: ${{ inputs.package_name }}
+          releaseFiles: play/${{ inputs.app_directory }}-android.aab
+          track: ${{ needs.prepare.outputs.play_track }}
+          status: ${{ needs.prepare.outputs.play_status }}
+          mappingFile: ${{ steps.files.outputs.mapping }}
+          debugSymbols: ${{ steps.files.outputs.symbols }}
+          whatsNewDirectory: ${{ steps.files.outputs.whatsnew }}
+
+      - name: Upload to Google Play (staged rollout)
+        if: needs.prepare.outputs.play_status == 'inProgress'
+        uses: r0adkll/upload-google-play@e738b9dd8f2476ea806d921b64aacd24f34515a5 # v1.1.5
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+          packageName: ${{ inputs.package_name }}
+          releaseFiles: play/${{ inputs.app_directory }}-android.aab
+          track: ${{ needs.prepare.outputs.play_track }}
+          status: inProgress
+          userFraction: ${{ needs.prepare.outputs.play_fraction }}
+          mappingFile: ${{ steps.files.outputs.mapping }}
+          debugSymbols: ${{ steps.files.outputs.symbols }}
+          whatsNewDirectory: ${{ steps.files.outputs.whatsnew }}
+
+  publish_testflight:
+    name: Upload to TestFlight
+    needs: [prepare, build_android, build_windows, build_ios]
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled') &&
+      needs.prepare.outputs.ios == 'true' &&
+      inputs.testflight
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      APPSTORE_KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+      APPSTORE_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+
+    steps:
+      - name: Download IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-ipa
+          path: ipa
+
+      # The build lands in TestFlight. Submitting it for App Store review and
+      # releasing it stays a manual step in App Store Connect.
+      - name: Upload to App Store Connect
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPSTORE_PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
+        run: |
+          mkdir -p "$HOME/.private_keys"
+          printf '%s\n' "$APPSTORE_PRIVATE_KEY" > "$HOME/.private_keys/AuthKey_${APPSTORE_KEY_ID}.p8"
+          xcrun altool --upload-app --type ios \
+            -f "$(find ipa -name '*.ipa' | head -n 1)" \
+            --apiKey "$APPSTORE_KEY_ID" \
+            --apiIssuer "$APPSTORE_ISSUER_ID"
